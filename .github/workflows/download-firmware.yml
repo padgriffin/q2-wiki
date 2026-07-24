@@ -1,3 +1,5 @@
+name: Download Q2 firmware
+
 on:
   schedule:
     - cron: "0 0 * * *"
@@ -12,72 +14,142 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Get latest available version
-        run: |
-          INFO=$(curl -s https://api.qidi3dprinter.com/code/x_q_2_version_info)
-          if [ -z "$INFO" ]; then
-            echo "Failed to fetch version info"
-            exit 1
-          fi
-          # Sanitize JSON by removing tabs and newlines for environment variable
-          INFO_SANITIZED=$(echo "$INFO" | tr -d '\t\n\r')
-          echo "INFO=$INFO_SANITIZED" >> $GITHUB_ENV
-
-      - name: Check if release exists
-        id: check_release
+      - name: Get latest available firmware
+        id: firmware
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          QIDI_DEVICE_ID: ${{ secrets.QIDI_DEVICE_ID }}
         run: |
-          VERSION=$(echo "$INFO" | jq -r '.firmware.version')
-          DESCRIPTION=$(echo "$INFO" | jq -r '.firmware.description.en_US')
-          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
-            echo "Failed to extract version from API response"
+          set -euo pipefail
+
+          if [[ -z "${QIDI_DEVICE_ID:-}" ]]; then
+            echo "Repository secret QIDI_DEVICE_ID is required." >&2
             exit 1
           fi
-          if [ -z "$DESCRIPTION" ] || [ "$DESCRIPTION" = "null" ]; then
-            DESCRIPTION="Firmware update for QIDI 3D printer"
+
+          DEVICE_ID=$(printf '%s' "$QIDI_DEVICE_ID" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')
+          if [[ ! "$DEVICE_ID" =~ ^[0-9A-F]+$ ]]; then
+            echo "QIDI_DEVICE_ID must be the hexadecimal CPU serial from /proc/cpuinfo." >&2
+            exit 1
           fi
-          
-          # Check if release already exists
-          if gh release view "$VERSION" >/dev/null 2>&1; then
-            echo "Release $VERSION already exists"
-            echo "exists=true" >> $GITHUB_OUTPUT
-          else
-            echo "Release $VERSION does not exist"
-            echo "exists=false" >> $GITHUB_OUTPUT
+
+          # Update request signing reverse-engineered by @thelegendtubaguy:
+          # https://github.com/thelegendtubaguy/QidiMax4CommunityWiki/blob/main/docs/qidi_client_firmware_update_flow.md
+          CURRENT_VERSION="01.01.01.01"
+          TIMESTAMP=$(date +%s%3N)
+          NONCE=$(openssl rand -hex 16)
+          SIGNATURE=$(printf '%s' 'qidi3d null' |
+            openssl dgst -sha256 -hmac 'qid3d-from-2025-CAFE-BABE' |
+            sed 's/^.* //')
+
+          RESPONSE=$(curl --fail-with-body --silent --show-error --get \
+            'https://api.qidimaker.com/backend/v1/fireware/upgrade-info' \
+            --data-urlencode 'hardware=QD_Q2' \
+            --data-urlencode "currentVersion=$CURRENT_VERSION" \
+            --data-urlencode "deviceId=$DEVICE_ID" \
+            -H 'Accept: */*' \
+            -H 'Accept-Language: en_US' \
+            -H 'Content-Type: application/json' \
+            -H "X-DeviceId: $DEVICE_ID" \
+            -H 'X-DeviceType: Q2' \
+            -H "X-Nonce: $NONCE" \
+            -H 'X-Platform: 3DPrinter' \
+            -H 'X-Region: NA' \
+            -H "X-Signature: $SIGNATURE" \
+            -H "X-Timestamp: $TIMESTAMP" \
+            -H 'X-Timezone: +00:00' \
+            -H "X-Version: $CURRENT_VERSION")
+
+          if ! jq -e '.code == 200 and .data.version and .data.url' <<<"$RESPONSE" >/dev/null; then
+            jq . <<<"$RESPONSE" >&2
+            exit 1
           fi
-          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+          VERSION=$(jq -r '.data.version | ltrimstr("V")' <<<"$RESPONSE")
+          DOWNLOAD_URL=$(jq -r '.data.url' <<<"$RESPONSE")
+          DESCRIPTION=$(jq -r '.data.description // "Firmware update for QIDI Q2"' <<<"$RESPONSE")
           {
-            echo "DESCRIPTION<<__EOF__"
+            echo "version=$VERSION"
+            echo "tag=V$VERSION"
+            echo "download_url=$DOWNLOAD_URL"
+            echo "description<<__EOF__"
             echo "$DESCRIPTION"
             echo "__EOF__"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Download firmware
-        if: steps.check_release.outputs.exists == 'false'
+      - name: Check if release exists
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.firmware.outputs.tag }}
         run: |
-          VERSION="${{ steps.check_release.outputs.VERSION }}"
-          echo "Downloading firmware version $VERSION"
-          wget "https://download_aws.qidi3dprinter.com/QD_Q2/Q2_$VERSION.zip" -O firmware.zip
-          if [ ! -f "firmware.zip" ]; then
-            echo "Failed to download firmware file"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists"
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $TAG does not exist"
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download and validate firmware
+        if: steps.release.outputs.exists == 'false'
+        id: bundle
+        env:
+          DOWNLOAD_URL: ${{ steps.firmware.outputs.download_url }}
+          API_VERSION: ${{ steps.firmware.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          curl --fail --location --silent --show-error "$DOWNLOAD_URL" -o firmware.zip
+          unzip -tq firmware.zip
+          unzip -p firmware.zip firmware_manifest.json > firmware-manifest.tmp
+          mv firmware-manifest.tmp firmware_manifest.json
+
+          SOC_VERSION=$(jq -er '.SOC.version' firmware_manifest.json)
+          if [[ "$SOC_VERSION" != "$API_VERSION" ]]; then
+            echo "API version $API_VERSION does not match manifest SOC version $SOC_VERSION." >&2
             exit 1
           fi
-          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+          ARCHIVE_FILES=$(unzip -Z1 firmware.zip)
+          while IFS= read -r component_file; do
+            if ! grep -Fqx "$component_file" <<<"$ARCHIVE_FILES"; then
+              echo "Firmware bundle is missing manifest file $component_file." >&2
+              exit 1
+            fi
+          done < <(jq -er '.SOC.file, .MCU.file, .THR.file, .BOX.file' firmware_manifest.json)
+
+          {
+            echo "soc_version=$SOC_VERSION"
+            echo "mcu_version=$(jq -er '.MCU.version' firmware_manifest.json)"
+            echo "thr_version=$(jq -er '.THR.version' firmware_manifest.json)"
+            echo "box_version=$(jq -er '.BOX.version' firmware_manifest.json)"
+            echo "sha256=$(sha256sum firmware.zip | cut -d' ' -f1)"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create release
-        if: steps.check_release.outputs.exists == 'false'
+        if: steps.release.outputs.exists == 'false'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ env.VERSION }}
-          name: Firmware ${{ env.VERSION }}
+          tag_name: ${{ steps.firmware.outputs.tag }}
+          name: Firmware ${{ steps.firmware.outputs.tag }}
           body: |
-            ${{ steps.check_release.outputs.DESCRIPTION }}
-            
+            ${{ steps.firmware.outputs.description }}
+
+            | Component | Version |
+            | --- | --- |
+            | SOC | ${{ steps.bundle.outputs.soc_version }} |
+            | MCU | ${{ steps.bundle.outputs.mcu_version }} |
+            | THR | ${{ steps.bundle.outputs.thr_version }} |
+            | BOX | ${{ steps.bundle.outputs.box_version }} |
+
+            Source: ${{ steps.firmware.outputs.download_url }}
+
+            SHA-256: `${{ steps.bundle.outputs.sha256 }}`
+
             ---
-            
+
             **Note:** The firmware.zip file is the property of QIDI Tech. Copyright © 2025 QIDI Tech All Rights Reserved.
-            
+
             This repository only automates the distribution of official firmware releases.
           files: firmware.zip
           draft: false
