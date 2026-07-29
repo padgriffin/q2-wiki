@@ -33,7 +33,7 @@ A popular replacement for the original PSU is the Mean Well [LRS-350-24](https:/
 
 Given that the printer operates at or at more than the PSU's rating, the [LRS-350N2-24](https://www.meanwell.com/Upload/PDF/LRS-350N2/LRS-350N2-spec.pdf) PSU may be favored over the LRS-350-24, as it handles boost power better than the LRS-350.
 
-Mean Well's LRS series don't have active power factor correction though. As of writing, there doesn't seem to be a 1:1 PSU replacement that can handle 350+ W, with active PFC.
+Mean Well's LRS series don't have active power factor correction (PFC) though. As of writing, there doesn't seem to be a 1:1 PSU replacement that can handle 350+ W, with active PFC.
 The Mean Well [RSP-320-24](https://www.meanwell.com/Upload/PDF/RSP-320/RSP-320-spec.pdf) PSU has active PFC and the same dimension as the original PSU, but unfortunately doesn't work because the printer operates at ~350W, and the 30W rating difference with the LRS-350 is enough to power cycle the RSP-320 when the heaters are started at the same time (note: interestingly the PSU works when manually delaying the nozzle and bed heaters by a couple of seconds but it power cycles at the beginning of a 3D print).
 
 Also note that the LRS series do not have a terminal protection cover, unlike the OEM PSU. Printing a cover (or finding an appropriate piece of plastic) - or at worst, taping the terminals with electrical tape - is recommended.
